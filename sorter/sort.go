@@ -11,6 +11,15 @@ import (
 	"sort"
 )
 
+const (
+	fileWithCountPrefix = "tmp-file-with-count"
+	stringRowDelimiter  = "\n"
+)
+
+var (
+	byteRowDelimiter = []byte(stringRowDelimiter)
+)
+
 type Sorter struct {
 	tmpDir string
 
@@ -19,6 +28,8 @@ type Sorter struct {
 
 	// all subs files for external sort merge
 	subFiles []*os.File
+
+	subFilesWithCount map[int]*os.File
 }
 
 // New - return new sorter struct
@@ -29,15 +40,27 @@ func New(chunkSize int) (*Sorter, error) {
 	}
 
 	return &Sorter{
-		tmpDir:    tempDir,
-		chunkSize: chunkSize,
+		tmpDir:            tempDir,
+		chunkSize:         chunkSize,
+		subFiles:          make([]*os.File, 0, 100),
+		subFilesWithCount: make(map[int]*os.File, 100),
 	}, nil
 }
 
 // Close - close all open files, then clean up garbage
 func (s *Sorter) Close() error {
+	const op = "Sorter.Close"
+
 	for _, file := range s.subFiles {
-		file.Close()
+		if err := file.Close(); err != nil {
+			log.Printf("%s:%s", op, err)
+		}
+	}
+
+	for _, file := range s.subFilesWithCount {
+		if err := file.Close(); err != nil {
+			log.Printf("%s:%s", op, err)
+		}
 	}
 
 	err := os.RemoveAll(s.tmpDir)
@@ -49,10 +72,12 @@ func (s *Sorter) Close() error {
 }
 
 func (s *Sorter) splitFileToChunks(file string) ([]*bufio.Reader, error) {
+	const op = "Sorter.splitFileToChunks"
+
 	// Open the input file
 	inputFile, err := os.Open(file)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	defer inputFile.Close()
 
@@ -69,7 +94,7 @@ func (s *Sorter) splitFileToChunks(file string) ([]*bufio.Reader, error) {
 				if errors.Is(err, io.EOF) {
 					break
 				}
-				return nil, err
+				return nil, fmt.Errorf("%s: %w", op, err)
 			}
 
 			chunk = append(chunk, string(line))
@@ -82,17 +107,11 @@ func (s *Sorter) splitFileToChunks(file string) ([]*bufio.Reader, error) {
 
 		subFile, err := s.newSortedSubFile(chunk, fCnt)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%s: %w", op, err)
 		}
 
 		// store sub file
 		s.subFiles = append(s.subFiles, subFile)
-	}
-
-	if fCnt >= s.chunkSize {
-		//TODO смержить файлы, пока мы не придем к значению chunkSize,
-		// чтобы честно читать столько строк, сколько нам разрешено
-		log.Println("little problem")
 	}
 
 	return s.getSubFileReaders(), nil
@@ -100,6 +119,8 @@ func (s *Sorter) splitFileToChunks(file string) ([]*bufio.Reader, error) {
 
 // newSortedSubFile - sort incoming slice of strings, and save it into new temp file with specific name
 func (s *Sorter) newSortedSubFile(chunk []string, subNumber int) (f *os.File, err error) {
+	const op = "Sorter.newSortedSubFile"
+
 	if len(chunk) == 0 {
 		return nil, nil
 	}
@@ -111,7 +132,7 @@ func (s *Sorter) newSortedSubFile(chunk []string, subNumber int) (f *os.File, er
 		filepath.Join(s.tmpDir, fmt.Sprintf("sub-%d.txt", subNumber)),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	defer func() {
 		if err != nil {
@@ -124,19 +145,18 @@ func (s *Sorter) newSortedSubFile(chunk []string, subNumber int) (f *os.File, er
 
 	// Write the sorted chunk to the sub-file
 	for _, line := range chunk {
-		if _, err := sub.WriteString(line + "\n"); err != nil {
-			return nil, err
+		if _, err := sub.WriteString(line + stringRowDelimiter); err != nil {
+			return nil, fmt.Errorf("%s: %w", op, err)
 		}
 	}
 
-	// Flush the buffer and add the sub-file to the slice
 	if err := sub.Flush(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
 	// Return cursor at the start of the file
 	if _, err := f.Seek(0, 0); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
 	return f, nil
@@ -153,30 +173,56 @@ func (s *Sorter) getSubFileReaders() []*bufio.Reader {
 	return readers
 }
 
+// getSubFileWithCountReaders - return readers for all sub files with count
+func (s *Sorter) getSubFileWithCountReaders() map[int]*bufio.Reader {
+	readers := make(map[int]*bufio.Reader, len(s.subFilesWithCount))
+
+	for key, file := range s.subFilesWithCount {
+		readers[key] = bufio.NewReader(file)
+	}
+
+	return readers
+}
+
+func (s *Sorter) writeToFileWithCount(data string, count int) error {
+	const op = "Sorter.writeToFileWithCount"
+
+	file, exist := s.subFilesWithCount[count]
+	if !exist {
+		var err error
+		file, err = os.Create(filepath.Join(s.tmpDir, fmt.Sprintf("%s-%d", fileWithCountPrefix, count)))
+		if err != nil {
+			return fmt.Errorf("%s: %w", op, err)
+		}
+
+		s.subFilesWithCount[count] = file
+	}
+
+	if _, err := file.WriteString(fmt.Sprintf("%s\t%d\n", data, count)); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	return nil
+}
+
 // CreateSortedCountFile - sort algorithm.
 // After call this one should defer Close
 // Steps:
 //  1. split file to chunks
 //  2. read all chunks
 //  3. look for a minimum string value and count it
-//  4. write uniq sorted lines with deduplicate-count into new file
-func (s *Sorter) CreateSortedCountFile() (*os.FileInfo, error) {
+//  4. write uniq lines with deduplicate-count into new files which has count in a name
+//  5. read this file with count in a name from biggest to lower and write line by line to output file
+func (s *Sorter) CreateSortedCountFile() (os.FileInfo, error) {
+	const op = "Sorter.CreateSortedCountFile"
+
 	// Read the input file in chunks and create sub-files
 	readers, err := s.splitFileToChunks("input.txt")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s, %w", op, err)
 	}
 
 	log.Printf("INFO: number of subfiles: %d", len(readers))
-
-	outputFile, err := os.Create("output.txt")
-	if err != nil {
-		return nil, err
-	}
-	defer outputFile.Close()
-
-	// Create a buffered writer for the output file
-	output := bufio.NewWriter(outputFile)
 
 	var (
 		// number of open files
@@ -193,7 +239,7 @@ func (s *Sorter) CreateSortedCountFile() (*os.FileInfo, error) {
 	for _, r := range readers {
 		line, _, err := r.ReadLine()
 		if err != nil {
-			log.Fatal(err)
+			return nil, fmt.Errorf("%s, %w", op, err)
 		}
 
 		lines = append(lines, string(line))
@@ -219,10 +265,8 @@ func (s *Sorter) CreateSortedCountFile() (*os.FileInfo, error) {
 		case minLine:
 			duplicateLineCount++
 		default:
-			if _, err := output.WriteString(
-				fmt.Sprintf("%s\t%d\n", currentLineValue, duplicateLineCount),
-			); err != nil {
-				return nil, err
+			if err := s.writeToFileWithCount(currentLineValue, duplicateLineCount); err != nil {
+				return nil, fmt.Errorf("%s, %w", op, err)
 			}
 
 			currentLineValue = minLine
@@ -238,23 +282,66 @@ func (s *Sorter) CreateSortedCountFile() (*os.FileInfo, error) {
 				lines[minIndex] = ""
 				continue
 			}
-			return nil, err
+			return nil, fmt.Errorf("%s, %w", op, err)
 		} else {
 			lines[minIndex] = string(line)
 		}
 	}
 
-	// write line with deduplicate-count as one row
-	if _, err := output.WriteString(
-		fmt.Sprintf("%s\t%d\n", currentLineValue, duplicateLineCount),
-	); err != nil {
-		return nil, err
+	// don't forget last row
+	if err := s.writeToFileWithCount(currentLineValue, duplicateLineCount); err != nil {
+		return nil, fmt.Errorf("%s, %w", op, err)
+	}
+
+	keys := make([]int, 0, len(s.subFilesWithCount))
+	for key, file := range s.subFilesWithCount {
+		keys = append(keys, key)
+
+		if _, err := file.Seek(0, 0); err != nil {
+			return nil, fmt.Errorf("%s, %w", op, err)
+		}
+	}
+
+	// sort keys due to golang hash map is unsorted
+	sort.Ints(keys)
+
+	readersWithCount := s.getSubFileWithCountReaders()
+
+	outputFile, err := os.Create("output.txt")
+	if err != nil {
+		return nil, fmt.Errorf("%s, %w", op, err)
+	}
+	defer outputFile.Close()
+
+	// Create a buffered writer for the output file
+	output := bufio.NewWriter(outputFile)
+
+	// write from bigger to lower duplicate-counter
+	for i := len(keys) - 1; i >= 0; i-- {
+		for {
+			line, _, err := readersWithCount[keys[i]].ReadLine()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return nil, fmt.Errorf("%s, %w", op, err)
+			}
+
+			if _, err := output.Write(append(line, byteRowDelimiter...)); err != nil {
+				return nil, fmt.Errorf("%s, %w", op, err)
+			}
+		}
 	}
 
 	// Flush the output buffer
 	if err := output.Flush(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s, %w", op, err)
 	}
 
-	return nil, nil
+	stat, err := outputFile.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("%s, %w", op, err)
+	}
+
+	return stat, nil
 }
