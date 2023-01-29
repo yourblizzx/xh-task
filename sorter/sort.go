@@ -87,13 +87,12 @@ func (s *Sorter) splitFileToChunks(file string) ([]*bufio.Reader, error) {
 
 		// store sub file
 		s.subFiles = append(s.subFiles, subFile)
+	}
 
-		if fCnt >= s.chunkSize {
-			// MERGE algo для уменьшения количества файлов
-			//TODO смержить файлы, пока мы не придем к значению chunkSize,
-			// чтобы честно читать столько строк, сколько нам разрешено
-			log.Println("little problem")
-		}
+	if fCnt >= s.chunkSize {
+		//TODO смержить файлы, пока мы не придем к значению chunkSize,
+		// чтобы честно читать столько строк, сколько нам разрешено
+		log.Println("little problem")
 	}
 
 	return s.getSubFileReaders(), nil
@@ -180,8 +179,8 @@ func (s *Sorter) CreateSortedCountFile() (*os.FileInfo, error) {
 	output := bufio.NewWriter(outputFile)
 
 	var (
-		// Create a slice to hold the indices of the sub-files
-		indices = make([]int, len(readers))
+		// number of open files
+		fileCount = len(readers)
 
 		// Create a slice to hold the current lines for each sub-file
 		lines = make([]string, 0, len(readers))
@@ -200,7 +199,7 @@ func (s *Sorter) CreateSortedCountFile() (*os.FileInfo, error) {
 		lines = append(lines, string(line))
 	}
 
-	for len(indices) > 0 {
+	for fileCount > 0 {
 		var (
 			minLine  string
 			minIndex int
@@ -233,13 +232,9 @@ func (s *Sorter) CreateSortedCountFile() (*os.FileInfo, error) {
 		// Read the next line from the sub-file
 		line, _, err := readers[minIndex].ReadLine()
 		if err != nil {
-			// If the sub-file is exhausted, remove it from the list
+			// If the sub-file is exhausted, decrease fileCount by one
 			if errors.Is(err, io.EOF) {
-				if len(indices) > 1 {
-					indices = append(indices[:minIndex], indices[minIndex+1:]...)
-				} else {
-					indices = indices[:len(indices)-1]
-				}
+				fileCount--
 				lines[minIndex] = ""
 				continue
 			}
